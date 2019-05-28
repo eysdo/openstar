@@ -1,6 +1,7 @@
 
 -- 用于生成唯一随机字符串
 local random = require "resty-random"
+local stool = require "stool"
 local cjson_safe = require "cjson.safe"
 local ngx_re_find = ngx.re.find
 local ngx_re_gsub = ngx.re.gsub
@@ -12,17 +13,22 @@ local config_dict = ngx.shared.config_dict
 local config = cjson_safe.decode(config_dict:get("config")) or {}
 local config_version = 0
 
---- 文件读写
-local function readfile(_filepath)
-    -- local fd = assert(io.open(_filepath,"r"),"readfile io.open error")
-    local fd,err = io.open(_filepath,"r")
-    if fd == nil then 
-        --ngx.log(ngx.ERR,"readfile error",err)
-        return
+--- 读取文件（全部读取/按行读取）
+local function readfile(_filepath,_ty)
+    local fd = io.open(_filepath,"r")
+    if not fd then return end
+    if not _ty then
+        local str = fd:read("*a") --- 全部内容读取
+        fd:close()
+        return str
+    else
+        local line_s = {}
+        for line in fd:lines() do
+            table.insert(line_s, line)
+        end
+        fd:close()
+        return line_s
     end
-    local str = fd:read("*a") --- 全部内容读取
-    fd:close()
-    return str
 end
 
 -- 默认写文件错误时，会将错误信息和_msg数据使用ngx.log写到错误日志中。
@@ -35,7 +41,7 @@ local function writefile(_filepath,_msg,_ty)
     local fd,err = io.open(_filepath,_ty)
     if fd == nil then
         ngx.log(ngx.ERR,"writefile msg : "..tostring(_msg),err)
-        return 
+        return
     end -- 文件读取错误返回
     fd:write(tostring(_msg))
     fd:flush()
@@ -74,7 +80,7 @@ local function tableTostring(_obj)
 end
 
 local function stringTotable(_str)
-    if _str == nil then return end
+    if not _str then return end
     local ret = loadstring("return ".._str)()
     return ret
 end
@@ -120,32 +126,55 @@ end
 --- 基础 常用二阶匹配规则
 -- 说明：[_restr,_options]  _str 就是被匹配的内容
 -- eg "ip":["*",""]
--- eg "hostname":[["www.abc.com","127.0.0.1"],"table"]
+-- eg "hostname":[["www.abc.com","127.0.0.1"],"list"]
 local function remath(_str,_re_str,_options)
     if _str == nil or _re_str == nil or _options == nil then return false end
-    if _options == "" then
+    if _options == "" or _options == "=" then
         -- 纯字符串匹配 * 表示任意
         if _str == _re_str or _re_str == "*" then
             return true
         end
-    elseif _options == "table" then
-        -- table 匹配，在table中 字符串完全匹配
+    elseif _options == "list" then
+        return stool.isInArrayTb(_str,_re_str)
+    elseif _options == "in" then
+        return stool.stringIn(_str,_re_str)
+        -- add new type
+    elseif _options == "len" then
+        if type(_re_str) ~= "table" then return false end
+        local len_str = #_str
+        if len_str >= _re_str[1] and len_str <= _re_str[2] then
+            return true
+        end
+    elseif _options == "start_list" then
         if type(_re_str) ~= "table" then return false end
         for _,v in ipairs(_re_str) do
-            if v == _str then
+            if stool.stringStarts(_str,v) then
                 return true
             end
         end
-    elseif _options == "in" then
-        --- 用于包含 查找 string.find
-        local from , to = string.find(_str, _re_str,1,true)
-        --if from ~= nil or (from == 1 and to == 0 ) then
-        --当_re_str=""时的情况 已处理
-        if from ~= nil and to ~= 0 then
-            return true
+    elseif _options == "end_list" then
+        if type(_re_str) ~= "table" then return false end
+        for _,v in ipairs(_re_str) do
+            if stool.stringEnds(_str,v) then
+                return true
+            end
         end
-    elseif _options == "list" then
-        --- list 匹配，o(1) 比table要好些， 字符串完全匹配
+    elseif _options == "in_list" then
+        if type(_re_str) ~= "table" then return false end
+        for _,v in ipairs(_re_str) do
+            if stool.stringIn(_str,v) then
+                return true
+            end
+        end
+    elseif _options == "rein_list" then
+        if type(_re_str) ~= "table" then return false end
+        for _,v in ipairs(_re_str) do
+            if stool.stringIn(_str,string.upper(v)) then
+                return true
+            end
+        end
+    elseif _options == "dict" then
+        --- 字典(dict) 匹配，o(1) 比序列(list)要好些， 字符串完全匹配
         if type(_re_str) ~= "table" then return false end
         local re = _re_str[_str]
         if re == true then -- 需要判断一下 有可能是值类型的值
@@ -179,8 +208,18 @@ local function remath(_str,_re_str,_options)
         --- 正则匹配
         local from, to = ngx_re_find(_str, _re_str, _options)
         if from ~= nil then
-            --return true,string.sub(_str, from, to)
-            return true
+            -- payload
+            -- start_num,end_num
+            local start_num = from
+            if from > 5 then
+                start_num = from - 5
+            end
+            local end_num = to
+            if (#_str - to) > 5 then
+                end_num = to + 5
+            end
+            return true,string.sub(_str, start_num, end_num)
+            --return true
         end
     end
 end
@@ -265,6 +304,31 @@ local function remath3(_tbMod,_modrule)
     end
 end
 
+-- 增加 post_form的规则匹配
+-- _tbMod : [["form name","file name","file type","file msg"],...]
+-- _modrule : ["\\.(jpg|jpeg|png|webp|gif)$","jio",["image0",2],true/false/flase]
+local function remath_form(_tbMod,_modrule)
+    if type(_tbMod) ~= "table" or type(_modrule) ~= "table" then
+        return false
+    end
+    local _re_str = _modrule[1]
+    local _options = _modrule[2]
+    local _form_name = _modrule[3][1]
+    local _form_n = _modrule[3][2]
+    local _Invert = _modrule[4]
+    if type(_form_n) ~= "number" or _form_n < 1 or _form_n > 4 then
+        return false
+    end
+    for _,v in ipairs(_tbMod) do
+        if v[1] == _form_name or _form_name == "*" then
+            local _str = v[_form_n]
+            if remath_Invert(_str,_re_str,_options,_Invert) then
+                return true
+            end
+        end
+    end
+end
+
 -- 基于modName 进行规则判断
 -- _modName = uri,cookie, args,posts...
 -- _modRule = ["admin","in"]
@@ -279,12 +343,20 @@ local function action_remath(_modName,_modRule,_base_Msg)
         return false
     end
     if type(_base_Msg[_modName]) == "table" then
-        if remath3(_base_Msg[_modName],_modRule) then
-            return true
+        if _modName == "post_form" then
+            if remath_form(_base_Msg[_modName],_modRule) then
+                return true
+            end
+        else
+            if remath3(_base_Msg[_modName],_modRule) then
+                return true
+            end
         end
     else
-        if remath_Invert(_base_Msg[_modName],_modRule[1],_modRule[2],_modRule[3]) then
-            return true
+        if _modRule[2] == "rein_list" then
+            return remath_Invert(string.upper(_base_Msg[_modName]),_modRule[1],_modRule[2],_modRule[3])
+        else
+            return remath_Invert(_base_Msg[_modName],_modRule[1],_modRule[2],_modRule[3])
         end
     end
 end
@@ -296,51 +368,10 @@ local function or_remath(_or_list,_basemsg)
     -- or 匹配 任意一个为真 则为真
     for _,v in ipairs(_or_list) do
         if action_remath(v[1],v[2],_basemsg) then -- 真
-            return true        
-        end        
-    end
-    return false
-end
-
--- 对自定义规则列表进行判断
--- 传入一个规则列表 和 base_msg
--- _app_list = ["uri",["admin","in"],"and"]
--- _app_list = ["cookie",["\\w{5}","jio",true],"or"]
--- _app_list = ["referer",["baidu","in",true]]
---  table 类型
--- _app_list = ["args",["^[\\w]{6}$","jio",["cc",3],true],"and"]
--- _app_list = ["args",["true","@token@",["cctoken"],true]]
--- _app_list = ["headers",["^[\\w]{6}$","jio",["sign"],true]]
---  post_form 表单
-local function re_app_ext(_app_list,_basemsg)
-    if type(_app_list) ~= "table" then return false end
-    local list_cnt = #_app_list
-    local tmp_or = {}
-    for i,v in ipairs(_app_list) do
-        if v[3] == "or" then
-            table.insert(tmp_or,v)
-            if i == list_cnt then
-                return or_remath(tmp_or,_basemsg)
-            end
-        else
-            if #tmp_or == 0 then -- 前面没 or
-                if action_remath(v[1],v[2],_basemsg) then -- 真
-                    -- continue
-                else -- 假 跳出
-                    return false
-                end
-            else -- 一组 or 计算
-                table.insert(tmp_or, v)
-                if or_remath(tmp_or,_basemsg) then -- 真
-                    -- continue
-                else
-                    return false
-                end
-                tmp_or = {} -- 清空 or 列表
-            end
+            return true
         end
     end
-    return true
+    return false
 end
 
 --- 拦截计数
@@ -362,9 +393,10 @@ local function ngx_find(_str)
 
     -- string.find 字符串 会走jit,所以就没有用ngx模块
     -- 当前情况下，对token仅是全局替换一次，请注意
-    if string.find(_str,"@token@") ~= nil then       
+    -- string.find(_str,"@token@") ~= nil
+    if stool.stringIn(_str,"@token@")  then
         _str = ngx_re_gsub(_str,"@token@",tostring(set_token()))
-    end 
+    end
     return _str
 end
 
@@ -377,11 +409,11 @@ local function sayHtml_ext(_html,_find_type,_content_type)
         _html = tableTojson(_html)
     end
 
-    if _find_type ~= nil then
+    if _find_type then
         _html = ngx_find(_html)
     end
 
-    if _content_type ~= nil then
+    if _content_type then
         ngx.header.content_type = _content_type
     end
 
@@ -390,10 +422,13 @@ local function sayHtml_ext(_html,_find_type,_content_type)
 end
 
 --- ngx_find 无条件使用
-local function sayFile(_filename)
+local function sayFile(_filename,_header)
     --ngx.header.content_type = "text/html"
     --local str = readfile(Config.base.htmlPath..filename)
     local str = readfile(_filename) or "filename error"
+    if _header then
+        ngx.header.content_type = _header
+    end
     -- 对读取的文件内容进行 ngx_find
     ngx.say(ngx_find(str))
     ngx.exit(200)
@@ -431,7 +466,7 @@ end
     local function get_post_all()
         --ngx.req.read_body()
         local data = ngx.req.get_body_data() -- ngx.req.get_post_args()
-        if not data then 
+        if not data then
             local datafile = ngx.req.get_body_file()
             if datafile then
                 local fh, err = io.open(datafile, "r")
@@ -446,6 +481,9 @@ end
     end
 
     local function get_table(_tb)
+        if _tb == nil then
+            return ""
+        end
         local tb_args = {}
         for k,v in pairs(_tb) do
             if type(v) == "table" then
@@ -464,6 +502,50 @@ end
         end
         return table.concat(tb_args,",")
     end
+
+-- 对自定义规则列表进行判断
+-- 传入一个规则列表 和 base_msg
+-- _app_list = ["uri",["admin","in"],"and"]
+-- _app_list = ["cookie",["\\w{5}","jio",true],"or"]
+-- _app_list = ["referer",["baidu","in",true]]
+--  table 类型
+-- _app_list = ["args",["^[\\w]{6}$","jio",["cc",3],true],"and"]
+-- _app_list = ["args",["true","@token@",["cctoken"],true]]
+-- _app_list = ["headers",["^[\\w]{6}$","jio",["sign"],true]]
+--  post_form 表单
+local function re_app_ext(_app_list,_basemsg)
+    if type(_app_list) ~= "table" then return false end
+    local list_cnt = #_app_list
+    local tmp_or = {}
+    for i,v in ipairs(_app_list) do
+        if v[1] == "posts_all" and _basemsg.posts_all == nil then
+            _basemsg.posts_all = get_post_all()
+        end
+        if v[3] == "or" then
+            table.insert(tmp_or,v)
+            if i == list_cnt then
+                return or_remath(tmp_or,_basemsg)
+            end
+        else
+            if #tmp_or == 0 then -- 前面没 or
+                if action_remath(v[1],v[2],_basemsg) then -- 真
+                    -- continue
+                else -- 假 跳出
+                    return false
+                end
+            else -- 一组 or 计算
+                table.insert(tmp_or, v)
+                if or_remath(tmp_or,_basemsg) then -- 真
+                    -- continue
+                else
+                    return false
+                end
+                tmp_or = {} -- 清空 or 列表
+            end
+        end
+    end
+    return true
+end
 
 local optl={}
 
